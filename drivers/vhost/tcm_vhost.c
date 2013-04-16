@@ -49,6 +49,7 @@
 #include <linux/virtio_scsi.h>
 #include <linux/llist.h>
 #include <linux/bitmap.h>
+#include <linux/mempool.h>
 
 #include "vhost.c"
 #include "vhost.h"
@@ -74,6 +75,11 @@ enum {
 #define VHOST_SCSI_MAX_VQ	128
 #define VHOST_SCSI_MAX_EVENT	128
 
+struct vhost_scsi_inflight {
+	struct completion comp; /* Wait for the flush operation to finish */
+	struct kref kref; /* Refcount for the inflight reqs */
+};
+
 struct vhost_scsi {
 	/* Protected by vhost_scsi->dev.mutex */
 	struct tcm_vhost_tpg **vs_tpg;
@@ -90,6 +96,10 @@ struct vhost_scsi {
 
 	bool vs_events_missed; /* any missed events, protected by vq->mutex */
 	int vs_events_nr; /* num of pending events, protected by vq->mutex */
+
+	struct vhost_scsi_inflight __rcu *vs_inflight; /* track inflight reqs */
+
+	mempool_t *vs_pool; /* for vhost_scsi_inflight */
 };
 
 /* Local pointer to allocated TCM configfs fabric module */
@@ -105,6 +115,60 @@ static int iov_num_pages(struct iovec *iov)
 {
 	return (PAGE_ALIGN((unsigned long)iov->iov_base + iov->iov_len) -
 	       ((unsigned long)iov->iov_base & PAGE_MASK)) >> PAGE_SHIFT;
+}
+
+static int tcm_vhost_set_inflight(struct vhost_scsi *vs)
+{
+	struct vhost_scsi_inflight *inflight;
+
+	inflight = mempool_alloc(vs->vs_pool, GFP_KERNEL);
+	if (!inflight)
+		return -ENOMEM;
+
+	kref_init(&inflight->kref);
+	init_completion(&inflight->comp);
+
+
+	rcu_assign_pointer(vs->vs_inflight, inflight);
+
+	/*
+	 * synchronize_rcu() is used to resolve the following
+	 * possible race window in tcm_vhost_get_inflight:
+	 * if inflight points to old inflight and
+	 * wait_for_completion runs before we call kref_get
+	 * We may free the old inflight
+	 * However, there is still one in flight which should be
+	 * tracked by the old inflight.
+	 */
+	synchronize_rcu();
+
+	return 0;
+}
+
+static struct vhost_scsi_inflight *
+tcm_vhost_get_inflight(struct vhost_scsi *vs)
+{
+	struct vhost_scsi_inflight *inflight;
+
+	rcu_read_lock();
+	inflight = rcu_dereference(vs->vs_inflight);
+	kref_get(&inflight->kref);
+	rcu_read_unlock();
+
+	return inflight;
+}
+
+void tcm_vhost_done_inflight(struct kref *kref)
+{
+	struct vhost_scsi_inflight *inflight;
+
+	inflight = container_of(kref, struct vhost_scsi_inflight, kref);
+	complete(&inflight->comp);
+}
+
+static void tcm_vhost_put_inflight(struct vhost_scsi_inflight *inflight)
+{
+	kref_put(&inflight->kref, tcm_vhost_done_inflight);
 }
 
 static int tcm_vhost_check_true(struct se_portal_group *se_tpg)
@@ -403,6 +467,8 @@ static void vhost_scsi_free_cmd(struct tcm_vhost_cmd *tv_cmd)
 		kfree(tv_cmd->tvc_sgl);
 	}
 
+	tcm_vhost_put_inflight(tv_cmd->inflight);
+
 	kfree(tv_cmd);
 }
 
@@ -553,6 +619,7 @@ static struct tcm_vhost_cmd *vhost_scsi_allocate_cmd(
 	tv_cmd->tvc_data_direction = data_direction;
 	tv_cmd->tvc_nexus = tv_nexus;
 	tv_cmd->tvc_vhost = vs;
+	tv_cmd->inflight = tcm_vhost_get_inflight(vs);
 
 	return tv_cmd;
 }
@@ -944,12 +1011,34 @@ static void vhost_scsi_flush_vq(struct vhost_scsi *vs, int index)
 
 static void vhost_scsi_flush(struct vhost_scsi *vs)
 {
-	int i;
+	struct vhost_scsi_inflight *inflight;
+	int i, ret;
 
+	/* inflight points to the old inflight */
+	inflight = rcu_dereference_protected(vs->vs_inflight,
+					     lockdep_is_held(&vs->dev.mutex));
+
+	/* Allocate a new inflight and make vs->vs_inflight points to it */
+	ret = tcm_vhost_set_inflight(vs);
+	if (ret < 0)
+		pr_warn("vhost_scsi_flush failed to allocate inflight\n");
+
+	/*
+	 * The inflight->kref was initialized to 1. We decrement it here to
+	 * indicate the start of the flush operation so that it will reach 0
+	 * when all the reqs are finished.
+	 */
+	kref_put(&inflight->kref, tcm_vhost_done_inflight);
+
+	/* Flush both the vhost poll and vhost work */
 	for (i = 0; i < VHOST_SCSI_MAX_VQ; i++)
 		vhost_scsi_flush_vq(vs, i);
 	vhost_work_flush(&vs->dev, &vs->vs_completion_work);
 	vhost_work_flush(&vs->dev, &vs->vs_event_work);
+
+	/* Wait for all reqs issued before the flush to be finished */
+	wait_for_completion(&inflight->comp);
+	mempool_free(inflight, vs->vs_pool);
 }
 
 /*
@@ -1158,11 +1247,22 @@ static int vhost_scsi_open(struct inode *inode, struct file *f)
 	if (!s)
 		return -ENOMEM;
 
+	/* We will have two inflight at most */
+	s->vs_pool = mempool_create_kmalloc_pool(2,
+			sizeof(struct vhost_scsi_inflight));
+	if (!s->vs_pool) {
+		kfree(s);
+		return -ENOMEM;
+	}
+
 	vhost_work_init(&s->vs_completion_work, vhost_scsi_complete_cmd_work);
 	vhost_work_init(&s->vs_event_work, tcm_vhost_evt_work);
 
 	s->vs_events_nr = 0;
 	s->vs_events_missed = false;
+
+	if (tcm_vhost_set_inflight(s) < 0)
+		return -ENOMEM;
 
 	s->vqs[VHOST_SCSI_VQ_CTL].handle_kick = vhost_scsi_ctl_handle_kick;
 	s->vqs[VHOST_SCSI_VQ_EVT].handle_kick = vhost_scsi_evt_handle_kick;
@@ -1191,6 +1291,8 @@ static int vhost_scsi_release(struct inode *inode, struct file *f)
 	vhost_dev_cleanup(&s->dev, false);
 	/* Jobs can re-queue themselves in evt kick handler. Do extra flush. */
 	vhost_scsi_flush(s);
+	kfree(s->vs_inflight);
+	mempool_destroy(s->vs_pool);
 	kfree(s);
 	return 0;
 }
