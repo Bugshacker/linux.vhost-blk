@@ -139,9 +139,8 @@ static void *vhost_test_stop_vq(struct vhost_test *n,
 	void *private;
 
 	mutex_lock(&vq->mutex);
-	private = rcu_dereference_protected(vq->private_data,
-					 lockdep_is_held(&vq->mutex));
-	rcu_assign_pointer(vq->private_data, NULL);
+	private = vq->private_data;
+	vq->private_data = NULL;
 	mutex_unlock(&vq->mutex);
 	return private;
 }
@@ -205,9 +204,8 @@ static long vhost_test_run(struct vhost_test *n, int test)
 		priv = test ? n : NULL;
 
 		/* start polling new socket */
-		oldpriv = rcu_dereference_protected(vq->private_data,
-						    lockdep_is_held(&vq->mutex));
-		rcu_assign_pointer(vq->private_data, priv);
+		oldpriv = vq->private_data;
+		vq->private_data = priv;
 
 		r = vhost_init_used(&n->vqs[index].vq);
 
