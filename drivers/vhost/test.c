@@ -48,11 +48,12 @@ static void handle_vq(struct vhost_test *n)
 	size_t len, total_len = 0;
 	void *private;
 
-	private = rcu_dereference_check(vq->private_data, 1);
-	if (!private)
-		return;
 
 	mutex_lock(&vq->mutex);
+	private = vq->private_data;
+	if (!private)
+		goto out;
+
 	vhost_disable_notify(&n->dev, vq);
 
 	for (;;) {
@@ -89,7 +90,7 @@ static void handle_vq(struct vhost_test *n)
 			break;
 		}
 	}
-
+out:
 	mutex_unlock(&vq->mutex);
 }
 
