@@ -32,3 +32,7 @@ config VHOST
 	---help---
 	  This option is selected by any driver which needs to access
 	  the core of vhost.
+
+if STAGING
+source "drivers/vhost/Kconfig.vsock"
+endif
